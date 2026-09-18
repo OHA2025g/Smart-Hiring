@@ -8,6 +8,7 @@ import {
   getMatchSourcesBanner,
   getSortLabel,
   filterUiMatchRows,
+  isApifyPipelineActive,
 } from '@/shared/lib/jobDetailMatchesUtils';
 
 export default function JobDetailMatchesTab({
@@ -30,8 +31,7 @@ export default function JobDetailMatchesTab({
   const kpiItems = useMemo(() => matchesKpiStripItems(kpis), [kpis]);
   const sourcesBanner = useMemo(() => getMatchSourcesBanner(safeAllMatches), [safeAllMatches]);
 
-  const apifyRunning =
-    apifyPipeline && ['search_running', 'enrich_running'].includes(apifyPipeline.status);
+  const apifyRunning = isApifyPipelineActive(apifyPipeline);
 
   if (!hasMatches) {
     return (

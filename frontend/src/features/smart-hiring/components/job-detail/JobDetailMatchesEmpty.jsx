@@ -6,6 +6,7 @@ import {
   computeEmptyStateKpis,
   canGenerateDemo,
   emptyRecommendationCopy,
+  isApifyPipelineActive,
 } from '@/shared/lib/jobDetailMatchesUtils';
 
 export default function JobDetailMatchesEmpty({
@@ -17,8 +18,7 @@ export default function JobDetailMatchesEmpty({
   demoGenerating,
 }) {
   const kpis = computeEmptyStateKpis({ matching, apifyPipeline, matchCount: 0 });
-  const apifyRunning =
-    apifyPipeline && ['search_running', 'enrich_running'].includes(apifyPipeline.status);
+  const apifyRunning = isApifyPipelineActive(apifyPipeline);
 
   return (
     <>

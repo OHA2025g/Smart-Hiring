@@ -14,6 +14,7 @@ from talent_acquisition.candidate_source import (
 
 DEFAULT_TOTAL_MATCH_LIMIT = 50
 AI_HIGH_MATCH_MIN_SCORE = 90.0  # inclusive: seeded fits use 90% as top tier
+LINKEDIN_FIRST_HIGH_FIT_MIN = 80.0
 
 
 def _final_score(match: Dict[str, Any]) -> float:
@@ -119,8 +120,19 @@ def order_job_match_results_linkedin_first(
     results: List[Dict[str, Any]],
     *,
     total_limit: int = DEFAULT_TOTAL_MATCH_LIMIT,
+    high_fit_min: float = LINKEDIN_FIRST_HIGH_FIT_MIN,
 ) -> List[Dict[str, Any]]:
-    """LinkedIn search flow: real LinkedIn profiles first, then inhouse talent database."""
+    """LinkedIn search flow with high-fit priority.
+
+    Order:
+      1) LinkedIn ≥80%
+      2) Inhouse/other ≥80%
+      3) Remaining LinkedIn
+      4) Remaining inhouse/other
+
+    This keeps LinkedIn high-fits first while preventing thin Apify rows from
+    burying strong talent-pool matches under the top-N limit.
+    """
     total_limit = max(1, int(total_limit))
     linkedin: List[Dict[str, Any]] = []
     inhouse: List[Dict[str, Any]] = []
@@ -138,7 +150,15 @@ def order_job_match_results_linkedin_first(
     linkedin.sort(key=_final_score, reverse=True)
     inhouse.sort(key=_final_score, reverse=True)
     other.sort(key=_final_score, reverse=True)
-    ordered = linkedin + inhouse + other
+
+    li_high = [r for r in linkedin if _final_score(r) >= high_fit_min]
+    li_rest = [r for r in linkedin if _final_score(r) < high_fit_min]
+    in_high = [r for r in inhouse if _final_score(r) >= high_fit_min]
+    in_rest = [r for r in inhouse if _final_score(r) < high_fit_min]
+    ot_high = [r for r in other if _final_score(r) >= high_fit_min]
+    ot_rest = [r for r in other if _final_score(r) < high_fit_min]
+
+    ordered = li_high + in_high + ot_high + li_rest + in_rest + ot_rest
     return ordered[:total_limit]
 
 

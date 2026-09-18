@@ -6,8 +6,13 @@ import pytest
 
 from talent_acquisition.apify_linkedin_connector import (
     ApifyClient,
+    build_email_actor_input,
     build_search_input,
+    extract_email_from_item,
+    extract_phone_from_item,
     extract_profile_urls_from_search_items,
+    is_placeholder_email,
+    is_real_email,
     normalize_enriched_profile,
     process_pending_apify_pipelines,
     validate_apify_config,
@@ -40,6 +45,7 @@ def test_build_search_input_from_job():
     assert payload["searchQuery"] == "Senior Engineer"
     assert payload["maxItems"] == 25
     assert payload["locations"] == ["Bangalore"]
+    assert payload["profileScraperMode"] == "Full + email search"
 
 
 def test_build_powerai_search_input_from_job():
@@ -73,8 +79,16 @@ def test_normalize_enriched_profile_maps_fields():
         "linkedinUrl": "https://www.linkedin.com/in/jane-doe",
         "location": "Bengaluru",
         "email": "jane@example.com",
-        "skills": ["Python", "SQL"],
-        "experiences": [{"title": "Engineer", "companyName": "Acme", "jobDescription": "Built pipelines"}],
+        "skills": ["Python (Programming Language)", "SQL"],
+        "experiences": [
+            {
+                "title": "Engineer",
+                "companyName": "Acme",
+                "jobDescription": "Built pipelines with Spark",
+                "startDate": {"year": 2019, "month": 1},
+                "endDate": {"year": 2024, "month": 1},
+            }
+        ],
     }
     out = normalize_enriched_profile(item, job={"id": "job-1"}, pipeline_id="pipe-1")
     assert out["full_name"] == "Jane Doe"
@@ -82,8 +96,65 @@ def test_normalize_enriched_profile_maps_fields():
     assert out["linkedin_url"].endswith("/jane-doe")
     assert out["source"] == "LINKEDIN"
     assert out["import_metadata"]["provider"] == "apify"
-    assert "Python" in [s["skill_name"] for s in out["skills"]]
+    skill_names = [s["skill_name"] for s in out["skills"]]
+    assert "Python (Programming Language)" in skill_names
+    assert "Python" in skill_names
+    assert "SQL" in skill_names
     assert "Built pipelines" in out["resume_text"]
+    assert out["total_experience_years"] == 5.0
+
+
+def test_normalize_infers_skills_from_headline_when_empty():
+    item = {
+        "fullName": "Alex Rao",
+        "headline": "Senior Python | Spark | AWS Engineer",
+        "linkedinUrl": "https://www.linkedin.com/in/alex-rao",
+        "skills": [],
+        "experiences": [],
+    }
+    out = normalize_enriched_profile(item, job={"id": "job-1"}, pipeline_id="pipe-1")
+    names = {s["skill_name"].lower() for s in out["skills"]}
+    assert "python" in names
+    assert "spark" in names
+    assert "aws" in names
+
+
+def test_placeholder_and_real_email_helpers():
+    assert is_placeholder_email("linkedin.jane@apify-import.local")
+    assert is_placeholder_email("")
+    assert is_real_email("jane@acme.com")
+    assert not is_real_email("linkedin.jane@apify-import.local")
+
+
+def test_extract_email_and_phone_from_item_shapes():
+    assert extract_email_from_item({"emails": [{"email": "a@b.com"}]}) == "a@b.com"
+    assert extract_email_from_item({"workEmail": "w@co.com"}) == "w@co.com"
+    assert extract_phone_from_item({"mobileNumber": "+91 98765 43210"}) == "+91 98765 43210"
+    assert extract_phone_from_item({"phones": [{"number": "9999999999"}]}) == "9999999999"
+
+
+def test_build_email_actor_input():
+    payload = build_email_actor_input(
+        ["https://www.linkedin.com/in/a", "https://www.linkedin.com/in/b"],
+        {"apify_max_results_per_search": 10},
+    )
+    assert payload["includeEmail"] is True
+    assert payload["maxResults"] == 2
+    assert len(payload["profileUrls"]) == 2
+
+
+def test_normalize_uses_work_email_and_phone():
+    item = {
+        "fullName": "Jane Doe",
+        "linkedinUrl": "https://www.linkedin.com/in/jane-doe",
+        "workEmail": "jane@acme.com",
+        "mobileNumber": "+1 555 0100",
+        "skills": [],
+        "experiences": [],
+    }
+    out = normalize_enriched_profile(item, job={"id": "job-1"}, pipeline_id="pipe-1")
+    assert out["email"] == "jane@acme.com"
+    assert out["phone"] == "+1 555 0100"
 
 
 @pytest.mark.asyncio
@@ -120,6 +191,7 @@ async def test_process_pending_advances_search_stage(monkeypatch):
         "status": "search_running",
         "search_run_id": "run-search",
         "search_dataset_id": "ds-search",
+        "search_actor_id": "powerai/linkedin-peoples-search-scraper",
         "enrich_actor_id": "dev_fusion/linkedin-profile-scraper",
     }
 
@@ -180,3 +252,115 @@ async def test_process_pending_advances_search_stage(monkeypatch):
 
     assert result["processed"] == 1
     assert fake_db.doc.get("enrich_run_id") == "run-enrich"
+
+
+@pytest.mark.asyncio
+async def test_harvestapi_starts_email_fallback(monkeypatch):
+    monkeypatch.setenv("APIFY_API_TOKEN", "test-token")
+
+    pipeline = {
+        "id": "pipe-1",
+        "job_id": "job-1",
+        "status": "search_running",
+        "search_run_id": "run-search",
+        "search_dataset_id": "ds-search",
+        "search_actor_id": "harvestapi/linkedin-profile-search",
+    }
+    upserted = []
+
+    class FakeDb:
+        def __init__(self):
+            self.doc = dict(pipeline)
+            self.jobs = self
+            self.candidates = self
+            self._candidate_rows = []
+
+        def __getitem__(self, name):
+            return self
+
+        async def find_one(self, query, projection=None, sort=None):
+            if query.get("id") == "pipe-1":
+                return dict(self.doc)
+            if query.get("job_id") == "job-1":
+                return {"id": "job-1", "title": "Engineer"}
+            if query.get("linkedin_url"):
+                for row in self._candidate_rows:
+                    if row.get("linkedin_url") == query.get("linkedin_url"):
+                        return dict(row)
+            return None
+
+        def find(self, query, projection=None):
+            outer = self
+
+            class Cursor:
+                def sort(self, *args, **kwargs):
+                    return self
+
+                def limit(self, n):
+                    return self
+
+                async def to_list(self, n):
+                    if "import_metadata.pipeline_id" in (query or {}):
+                        return list(outer._candidate_rows)
+                    return [pipeline]
+
+            return Cursor()
+
+        async def update_one(self, query, update):
+            if "$set" in update:
+                self.doc.update(update["$set"])
+
+    fake_db = FakeDb()
+
+    async def fake_get_run(self, run_id):
+        return {"status": "SUCCEEDED", "defaultDatasetId": "ds-search"}
+
+    async def fake_list_items(self, dataset_id, limit=1000):
+        return [
+            {
+                "fullName": "Jane Doe",
+                "linkedinUrl": "https://www.linkedin.com/in/jane-doe",
+                "headline": "Engineer",
+            }
+        ]
+
+    async def fake_start(self, actor_id, run_input):
+        assert "email" in actor_id or "khadinakbar" in actor_id
+        assert run_input.get("includeEmail") is True
+        assert run_input.get("profileUrls")
+        return {"id": "run-email", "defaultDatasetId": "ds-email"}
+
+    async def fake_upsert(candidate):
+        upserted.append(candidate)
+        fake_db._candidate_rows.append(
+            {
+                "id": "cand-1",
+                "linkedin_url": candidate.get("linkedin_url"),
+                "email": candidate.get("email"),
+                "import_metadata": candidate.get("import_metadata") or {},
+            }
+        )
+        return candidate
+
+    with patch.object(ApifyClient, "get_run", fake_get_run), patch.object(
+        ApifyClient, "list_dataset_items", fake_list_items
+    ), patch.object(ApifyClient, "start_actor_run", fake_start):
+        cfg = {
+            "enabled": True,
+            "api_mode": "apify",
+            "apify_email_fallback_enabled": True,
+            "apify_email_actor_id": "khadinakbar/linkedin-profile-email-scraper",
+        }
+        result = await process_pending_apify_pipelines(
+            fake_db,
+            cfg,
+            fake_upsert,
+            limit=1,
+            pipeline_id="pipe-1",
+        )
+
+    assert result["processed"] == 1
+    assert len(upserted) == 1
+    assert is_placeholder_email(upserted[0]["email"])
+    assert fake_db.doc.get("status") == "email_running"
+    assert fake_db.doc.get("email_run_id") == "run-email"

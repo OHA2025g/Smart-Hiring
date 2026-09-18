@@ -753,6 +753,10 @@ const AdminIntegrationsPage = () => {
                   />
                   Enable optional email fallback actor (khadinakbar) for profiles without email
                 </label>
+                <p className="aic-hint" style={{ marginTop: 4, opacity: 0.8, fontSize: 12 }}>
+                  HarvestAPI search always uses Full + email search. When this is on, profiles that
+                  still lack a real email are re-checked via the email actor.
+                </p>
               </>
             ) : (
               <>

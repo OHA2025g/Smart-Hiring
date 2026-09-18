@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { useParams, Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { jobsApi, applicationsApi } from '@/shared/lib/api';
 import { Card, CardContent } from '@/shared/ui/card';
@@ -21,7 +21,7 @@ import JobDetailOverviewTab from '@/features/smart-hiring/components/job-detail/
 import JobDetailCandidatesTab from '@/features/smart-hiring/components/job-detail/JobDetailCandidatesTab';
 import JobDetailMatchesTab from '@/features/smart-hiring/components/job-detail/JobDetailMatchesTab';
 import { statusBadgeClass } from '@/shared/lib/jobDetailOverviewUtils';
-import { filterUiMatchRows } from '@/shared/lib/jobDetailMatchesUtils';
+import { filterUiMatchRows, isApifyPipelineActive } from '@/shared/lib/jobDetailMatchesUtils';
 
 const JOB_DETAIL_STAGE_BADGE = {
   SOURCED: 'bg-slate-100 text-slate-600',
@@ -76,6 +76,7 @@ const JobDetailPage = () => {
   const [demoGenerating, setDemoGenerating] = useState(false);
   const [stageUpdatingId, setStageUpdatingId] = useState(null);
   const { runWithClearanceCheck, clearanceDialog } = useAssessmentClearance();
+  const autoScoredPipelineRef = useRef(null);
 
   const jobCandidateIds = useMemo(
     () => [...new Set(applications.map((a) => a.candidate_id).filter(Boolean))],
@@ -91,15 +92,49 @@ const JobDetailPage = () => {
     fetchJobDetails();
   }, [jobId]);
 
+  // Hydrate latest Apify pipeline on load so completed imports can auto-score.
+  useEffect(() => {
+    if (!jobId) return undefined;
+    autoScoredPipelineRef.current = null;
+    setMatchingCandidates([]);
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await jobsApi.getApifyLinkedInRun(jobId);
+        if (!cancelled) setApifyPipeline(res.data?.pipeline || null);
+      } catch {
+        /* ignore */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId]);
+
   useEffect(() => {
     if (tabParam && ['overview', 'candidates', 'matches'].includes(tabParam)) {
       setActiveTab(tabParam);
     }
   }, [tabParam]);
 
+  const runLinkedInFirstMatch = async () => {
+    setMatching(true);
+    try {
+      const matchRes = await jobsApi.match(jobId, { linkedin_first: true });
+      setMatchingCandidates(filterUiMatchRows(matchRes.data.matches || []));
+      setMatchOrderMode('linkedin_first');
+      setActiveTab('matches');
+      if (matchRes.data?.apify_pipeline) {
+        setApifyPipeline(matchRes.data.apify_pipeline);
+      }
+    } finally {
+      setMatching(false);
+    }
+  };
+
   useEffect(() => {
     const status = apifyPipeline?.status;
-    if (!jobId || !status || !['search_running', 'enrich_running'].includes(status)) {
+    if (!jobId || !status || !isApifyPipelineActive(apifyPipeline)) {
       return undefined;
     }
     const timer = setInterval(async () => {
@@ -112,14 +147,11 @@ const JobDetailPage = () => {
           toast.success(
             `LinkedIn search complete — ${pipeline.candidates_ingested || 0} profile(s) imported`
           );
-          setMatching(true);
           try {
-            const matchRes = await jobsApi.match(jobId, { linkedin_first: true });
-            setMatchingCandidates(filterUiMatchRows(matchRes.data.matches || []));
-            setMatchOrderMode('linkedin_first');
-            setActiveTab('matches');
-          } finally {
-            setMatching(false);
+            await runLinkedInFirstMatch();
+          } catch {
+            /* match errors toast below via silent fail — surface lightly */
+            toast.message('Profiles imported. Click Find Matches to rank them.');
           }
         } else if (pipeline?.status === 'failed') {
           clearInterval(timer);
@@ -131,6 +163,27 @@ const JobDetailPage = () => {
     }, 12000);
     return () => clearInterval(timer);
   }, [jobId, apifyPipeline?.status, apifyPipeline?.id]);
+
+  // If Apify already finished (e.g. email stage completed while poll was stopped), score once.
+  useEffect(() => {
+    if (!jobId || matching || matchingCandidates.length > 0) return undefined;
+    if (apifyPipeline?.status !== 'completed') return undefined;
+    if (!(apifyPipeline.candidates_ingested > 0)) return undefined;
+    const pipeKey = `${apifyPipeline.id || 'na'}:${apifyPipeline.updated_at || apifyPipeline.candidates_ingested}`;
+    if (autoScoredPipelineRef.current === pipeKey) return undefined;
+    autoScoredPipelineRef.current = pipeKey;
+    let cancelled = false;
+    (async () => {
+      try {
+        if (!cancelled) await runLinkedInFirstMatch();
+      } catch {
+        /* user can click Find Matches */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId, apifyPipeline?.status, apifyPipeline?.candidates_ingested, apifyPipeline?.id, apifyPipeline?.updated_at]);
 
   const fetchJobDetails = async () => {
     try {
@@ -205,7 +258,7 @@ const JobDetailPage = () => {
       const ai = response.data.ai_high_match_count;
       const li = response.data.linkedin_count;
       const pipeline = response.data.apify_pipeline;
-      if (pipeline && ['search_running', 'enrich_running'].includes(pipeline.status)) {
+      if (pipeline && isApifyPipelineActive(pipeline)) {
         toast.info('Searching LinkedIn via Apify — profiles will appear in a few minutes.');
       } else if (typeof ex === 'number' && typeof tp === 'number' && typeof ai === 'number') {
         const liPart = typeof li === 'number' ? `, ${li} LinkedIn` : '';
@@ -340,8 +393,7 @@ const JobDetailPage = () => {
             className="jd-action jd-action-blue"
             onClick={handleApifyLinkedInSearch}
             disabled={
-              matching ||
-              (apifyPipeline && ['search_running', 'enrich_running'].includes(apifyPipeline.status))
+              matching || isApifyPipelineActive(apifyPipeline)
             }
             data-testid="search-linkedin-apify-btn"
           >

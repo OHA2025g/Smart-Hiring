@@ -10,7 +10,7 @@ def _row(candidate, score):
     return {"candidate": candidate, "fit_score": {"final_score": score}}
 
 
-def test_linkedin_first_puts_linkedin_before_inhouse():
+def test_linkedin_first_puts_high_fit_linkedin_before_inhouse():
     linkedin = _row(
         {
             "id": "li-1",
@@ -18,12 +18,28 @@ def test_linkedin_first_puts_linkedin_before_inhouse():
             "linkedin_url": "https://www.linkedin.com/in/jane",
             "import_metadata": {"provider": "apify"},
         },
-        70,
+        85,
     )
     inhouse = _row({"id": "tp-1", "source": "BULK_SEED", "full_name": "Bulk Seed 1"}, 95)
     ordered = order_job_match_results_linkedin_first([inhouse, linkedin])
     assert ordered[0]["candidate"]["id"] == "li-1"
     assert ordered[1]["candidate"]["id"] == "tp-1"
+
+
+def test_linkedin_first_surfaces_high_fit_inhouse_before_low_fit_linkedin():
+    linkedin_low = _row(
+        {
+            "id": "li-low",
+            "source": "LINKEDIN",
+            "linkedin_url": "https://www.linkedin.com/in/low",
+            "import_metadata": {"provider": "apify"},
+        },
+        55,
+    )
+    inhouse_high = _row({"id": "tp-high", "source": "BULK_SEED", "full_name": "Bulk Seed 1"}, 92)
+    ordered = order_job_match_results_linkedin_first([linkedin_low, inhouse_high])
+    assert ordered[0]["candidate"]["id"] == "tp-high"
+    assert ordered[1]["candidate"]["id"] == "li-low"
 
 
 def test_grid_order_unchanged_by_default():

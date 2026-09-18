@@ -11,6 +11,17 @@ export const TARGET_FIT_LABEL = '80%+';
 export const EXPECTED_SHORTLIST_LABEL = '12–18';
 export const MIN_MATCH_SCORE = 70;
 
+/** Apify pipeline statuses that mean LinkedIn ingest is still in flight. */
+export const APIFY_PIPELINE_ACTIVE_STATUSES = [
+  'search_running',
+  'enrich_running',
+  'email_running',
+];
+
+export function isApifyPipelineActive(pipeline) {
+  return Boolean(pipeline && APIFY_PIPELINE_ACTIVE_STATUSES.includes(pipeline.status));
+}
+
 const FIT_TIERS = [
   { key: 'excellent', min: 80, label: 'Excellent Match', badge: 'Top Match', badgeClass: 'green' },
   { key: 'good', min: 60, label: 'Good Match', badge: 'Good Match', badgeClass: 'yellow' },
@@ -70,17 +81,23 @@ export function getBarFillClass(score) {
 }
 
 export function getSearchStatus({ matching, apifyPipeline, matchCount }) {
-  const apifyRunning =
-    apifyPipeline && ['search_running', 'enrich_running'].includes(apifyPipeline.status);
-
   if (matching) {
     return { label: 'Searching…', className: 'orange' };
   }
-  if (apifyRunning) {
+  if (isApifyPipelineActive(apifyPipeline)) {
+    if (apifyPipeline.status === 'email_running') {
+      return { label: 'Finding emails…', className: 'orange' };
+    }
     return { label: 'LinkedIn in progress', className: 'orange' };
   }
   if (matchCount > 0) {
     return { label: 'Complete', className: 'green' };
+  }
+  if (
+    apifyPipeline?.status === 'completed' &&
+    (apifyPipeline.candidates_ingested || 0) > 0
+  ) {
+    return { label: 'Imported — scoring…', className: 'orange' };
   }
   return { label: 'Not started', className: 'orange' };
 }

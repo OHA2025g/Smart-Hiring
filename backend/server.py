@@ -2587,10 +2587,223 @@ def _job_skill_sets(job: Dict[str, Any]) -> tuple[set, set]:
 def _candidate_skill_set(candidate: Dict[str, Any]) -> set:
     out = set()
     for s in candidate.get("skills", []) or []:
-        name = _norm(s.get("skill_name"))
-        if name:
-            out.add(name)
+        name = _norm(s.get("skill_name") if isinstance(s, dict) else s)
+        if not name:
+            continue
+        out.add(name)
+        # LinkedIn labels often include parentheticals: "python (programming language)"
+        if "(" in name:
+            base = name.split("(", 1)[0].strip()
+            if base:
+                out.add(base)
     return out
+
+
+def _candidate_text_blob(candidate: Dict[str, Any]) -> str:
+    skill_names = []
+    for s in candidate.get("skills", []) or []:
+        if isinstance(s, dict) and s.get("skill_name"):
+            skill_names.append(str(s.get("skill_name")))
+        elif isinstance(s, str):
+            skill_names.append(s)
+    return _norm(
+        " ".join(
+            [
+                candidate.get("headline") or "",
+                candidate.get("summary") or "",
+                candidate.get("resume_text") or "",
+                " ".join(skill_names),
+            ]
+        )
+    )
+
+
+# Duty-style JD "skills" rarely appear verbatim on LinkedIn — map to evidence phrases.
+_SKILL_EVIDENCE_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "monitor and address hni clients": (
+        "hni",
+        "uhni",
+        "uhnwi",
+        "high-net-worth",
+        "high net worth",
+        "ultra high-net-worth",
+        "ultra high net worth",
+        "wealth management",
+        "wealth manager",
+        "relationship management",
+        "portfolio management",
+        "private banking",
+        "private banker",
+    ),
+    "outbond sales": ("outbound sales", "outbound", "sales"),
+    "outbound sales": ("outbound sales", "outbound", "sales"),
+    "inbound sales": ("inbound sales", "inbound", "sales"),
+    "business development": ("business development", "biz dev", "sales"),
+    "investment banking": ("investment banking", "investment", "banking"),
+    "banking and investment": ("banking", "investment", "wealth", "finance"),
+    "cross selling": ("cross selling", "cross-sell", "cross sell", "upsell"),
+}
+
+_TITLE_ROLE_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "wealth manager": (
+        "wealth manager",
+        "wealth management",
+        "private banker",
+        "private banking",
+        "relationship manager",
+        "portfolio manager",
+        "financial advisor",
+        "financial adviser",
+        "hni",
+        "uhni",
+        "high-net-worth",
+        "high net worth",
+        "ultra high-net-worth",
+        "ultra high net worth",
+    ),
+}
+
+_SKILL_STOP_TOKENS = frozenset(
+    {
+        "and",
+        "or",
+        "the",
+        "a",
+        "an",
+        "to",
+        "of",
+        "for",
+        "with",
+        "from",
+        "in",
+        "on",
+        "at",
+        "address",
+        "monitor",
+        "clients",
+        "client",
+        "using",
+        "via",
+    }
+)
+
+
+def _evidence_terms_for_skill(skill: str) -> List[str]:
+    s = _norm(skill)
+    terms: List[str] = [s]
+    aliases = _SKILL_EVIDENCE_ALIASES.get(s)
+    if aliases:
+        terms.extend(aliases)
+    for tok in _tokenize(s):
+        if tok not in _SKILL_STOP_TOKENS and len(tok) >= 3:
+            terms.append(tok)
+    # de-dupe, keep order
+    out: List[str] = []
+    seen: set[str] = set()
+    for t in terms:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _skill_evidenced_in_profile(skill: str, blob: str, candidate_skills: set) -> bool:
+    """True when LinkedIn profile evidence supports a JD skill / duty phrase."""
+    s = _norm(skill)
+    if not s:
+        return False
+    if s in candidate_skills or s in blob:
+        return True
+    for cs in candidate_skills:
+        if s in cs or cs in s:
+            return True
+    terms = _evidence_terms_for_skill(s)
+    # Strong single-hit aliases (domain markers)
+    strong = {
+        "hni",
+        "uhni",
+        "uhnwi",
+        "high-net-worth",
+        "high net worth",
+        "ultra high-net-worth",
+        "ultra high net worth",
+        "wealth management",
+        "wealth manager",
+        "investment banking",
+        "relationship management",
+        "portfolio management",
+        "private banking",
+    }
+    hits = 0
+    for t in terms:
+        present = t in blob or t in candidate_skills or any(t in cs or cs in t for cs in candidate_skills)
+        if not present:
+            continue
+        if t in strong or t == s:
+            return True
+        hits += 1
+        if hits >= 2:
+            return True
+    return False
+
+
+def _expand_candidate_skills_for_job(candidate: Dict[str, Any], job_skills: set) -> set:
+    """Soft-match job skills against candidate skills + headline/resume text."""
+    expanded = set(_candidate_skill_set(candidate))
+    if not job_skills:
+        return expanded
+    blob = _candidate_text_blob(candidate)
+    for js in job_skills:
+        if not js or js in expanded:
+            continue
+        if _skill_evidenced_in_profile(js, blob, expanded):
+            expanded.add(js)
+            continue
+        if js in blob:
+            expanded.add(js)
+            continue
+        for cs in list(expanded):
+            if js in cs or cs in js:
+                expanded.add(js)
+                break
+    return expanded
+
+
+def _linkedin_soft_title_score(job_title: str, candidate: Dict[str, Any], base_score: float) -> float:
+    """Raise LinkedIn title score when role family evidence appears in headline/resume."""
+    jt = _norm(job_title)
+    if not jt:
+        return base_score
+    blob = _candidate_text_blob(candidate)
+    headline = _norm(candidate.get("headline") or "")
+    if jt in headline or jt in blob:
+        return max(base_score, 92.0)
+
+    aliases = list(_TITLE_ROLE_ALIASES.get(jt) or ())
+    if not aliases:
+        # Generic: significant job-title tokens present in profile
+        toks = [t for t in _tokenize(jt) if t not in _SKILL_STOP_TOKENS and len(t) >= 4]
+        if toks:
+            hit_n = sum(1 for t in toks if t in blob)
+            ratio = hit_n / len(toks)
+            if ratio >= 1.0:
+                return max(base_score, 88.0)
+            if ratio >= 0.5:
+                return max(base_score, 70.0)
+        return base_score
+
+    hit_n = sum(1 for a in aliases if a in blob)
+    if hit_n >= 2:
+        return max(base_score, 90.0)
+    if hit_n == 1:
+        return max(base_score, 78.0)
+    return base_score
+
+
+def _is_linkedin_or_apify_candidate(candidate: Dict[str, Any]) -> bool:
+    source = str(candidate.get("source") or "").upper()
+    provider = str((candidate.get("import_metadata") or {}).get("provider") or "").lower()
+    return source == "LINKEDIN" or provider == "apify"
 
 def compute_match_score(job: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -2729,18 +2942,35 @@ def _merge_candidate_docs(existing: Dict[str, Any], incoming: Dict[str, Any]) ->
             return incoming_val
         return existing_val
 
+    def _is_placeholder_email(email: Any) -> bool:
+        e = str(email or "").strip().lower()
+        if not e or "@" not in e:
+            return True
+        return e.endswith("@apify-import.local") or e.endswith("@linkedin.local")
+
+    def pick_prefer_real_email(existing_val: Any, incoming_val: Any) -> Any:
+        """Prefer a real email over Apify/LinkedIn placeholder addresses."""
+        if incoming_val and not _is_placeholder_email(incoming_val):
+            return str(incoming_val).strip()
+        if existing_val and not _is_placeholder_email(existing_val):
+            return existing_val
+        return pick_non_empty(existing_val, incoming_val)
+
     existing_sources = existing.get("sources") or []
     if not isinstance(existing_sources, list):
         existing_sources = []
     incoming_source = incoming.get("source") or ""
     merged_sources = _unique_sources(*existing_sources, incoming_source)
 
+    preferred_email = pick_prefer_real_email(existing.get("email"), incoming.get("email"))
+    preferred_phone = pick_non_empty(existing.get("phone"), incoming.get("phone"))
+
     merged = {
         **existing,
         # Canonical identity keys (never overwrite `id`).
         "full_name": pick_non_empty(existing.get("full_name"), incoming.get("full_name")),
-        "email": pick_non_empty(existing.get("email"), incoming.get("email")),
-        "phone": pick_non_empty(existing.get("phone"), incoming.get("phone")),
+        "email": preferred_email,
+        "phone": preferred_phone,
         "location": pick_non_empty(existing.get("location"), incoming.get("location")),
         "headline": pick_non_empty(existing.get("headline"), incoming.get("headline")),
         "total_experience_years": existing.get("total_experience_years") or incoming.get("total_experience_years"),
@@ -2749,9 +2979,11 @@ def _merge_candidate_docs(existing: Dict[str, Any], incoming: Dict[str, Any]) ->
         "experience": existing.get("experience") or incoming.get("experience") or [],
         "source": "|".join(merged_sources[:3]) if merged_sources else existing.get("source"),
         "sources": merged_sources,
-        "email_lc": _norm_email(incoming.get("email")) or existing.get("email_lc"),
+        "email_lc": _norm_email(preferred_email) or existing.get("email_lc"),
         "full_name_lc": _norm_full_name(incoming.get("full_name")) or existing.get("full_name_lc"),
-        "phone_lc": _norm_phone_digits(incoming.get("phone")) or existing.get("phone_lc"),
+        "phone_lc": _norm_phone_digits(
+            preferred_phone if isinstance(preferred_phone, str) else None
+        ) or existing.get("phone_lc"),
         "resume_content_hash": _resume_content_hash(incoming.get("resume_text")) or existing.get("resume_content_hash"),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -3717,10 +3949,15 @@ def _experience_fit_score(candidate: Dict[str, Any], job: Dict[str, Any]) -> flo
     """Map years of experience to 0–100 using job minimum when available."""
     raw = candidate.get("total_experience_years")
     if raw is None:
+        # LinkedIn imports often omit years; treat as neutral-positive rather than a hard drag.
+        if _is_linkedin_or_apify_candidate(candidate):
+            return 70.0
         return 50.0
     try:
         years = float(raw)
     except (TypeError, ValueError):
+        if _is_linkedin_or_apify_candidate(candidate):
+            return 70.0
         return 50.0
     req = job.get("min_experience_years") or job.get("years_of_experience_min")
     if req is not None:
@@ -3736,30 +3973,58 @@ def compute_basic_fit_score(job: Dict, candidate: Dict) -> Dict[str, Any]:
     """Deterministic fit score without LLM — per-candidate title, resume, and experience."""
     det = compute_match_score(job, candidate)
     job_skills, must_have = _job_skill_sets(job)
-    candidate_skills = _candidate_skill_set(candidate)
+    candidate_skills = _expand_candidate_skills_for_job(candidate, job_skills | must_have)
 
     matched_skills = job_skills.intersection(candidate_skills)
     skill_match_pct = (len(matched_skills) / len(job_skills) * 100) if job_skills else float(det.get("skill_score", 0))
-    must_have_ok = bool(det.get("must_have_ok", True))
+    must_have_ok = must_have.issubset(candidate_skills) if must_have else True
+    # Soft must-have for LinkedIn/Apify sourced profiles: avoid crushing otherwise strong fits
+    soft_must_have = False
+    if not must_have_ok and must_have and _is_linkedin_or_apify_candidate(candidate):
+        blob = _candidate_text_blob(candidate)
+        soft_hits = {
+            m
+            for m in must_have
+            if m in blob or m in candidate_skills or _skill_evidenced_in_profile(m, blob, candidate_skills)
+        }
+        if soft_hits == must_have:
+            must_have_ok = True
+            soft_must_have = True
+            matched_skills = matched_skills | soft_hits
+            skill_match_pct = (
+                (len(job_skills.intersection(candidate_skills | soft_hits)) / len(job_skills) * 100)
+                if job_skills
+                else skill_match_pct
+            )
+        elif soft_hits:
+            soft_must_have = True
 
     weights = (job.get("scoring_rubric") or {}).get("weights") or {"title": 0.2, "skill": 0.4, "activity": 0.3, "experience": 0.1}
     title_score = float(det.get("title_score", 0))
+    if _is_linkedin_or_apify_candidate(candidate):
+        job_title = job.get("normalized_title") or job.get("title") or ""
+        title_score = _linkedin_soft_title_score(str(job_title), candidate, title_score)
 
     resume_text = (candidate.get("resume_text") or "").strip()
     if resume_text:
         activity_match_pct = float(det.get("description_score", 0))
+        if _is_linkedin_or_apify_candidate(candidate):
+            # LinkedIn resume/JD token overlap is often sparse; blend with skill/title signal
+            activity_match_pct = max(
+                activity_match_pct,
+                skill_match_pct * 0.9,
+                title_score * 0.8,
+            )
     else:
         job_acts = {_norm(a) for a in (job.get("activities") or []) if _norm(a)}
-        cand_blob = _norm(
-            " ".join(
-                [candidate.get("headline") or "", " ".join(candidate_skills), candidate.get("summary") or ""]
-            )
-        )
+        cand_blob = _candidate_text_blob(candidate)
         if job_acts:
             hits = sum(1 for act in job_acts if act in cand_blob)
             activity_match_pct = (hits / len(job_acts)) * 100.0
         else:
             activity_match_pct = title_score
+        if _is_linkedin_or_apify_candidate(candidate):
+            activity_match_pct = max(activity_match_pct, skill_match_pct * 0.85, title_score * 0.75)
 
     experience_score = _experience_fit_score(candidate, job)
 
@@ -3770,7 +4035,13 @@ def compute_basic_fit_score(job: Dict, candidate: Dict) -> Dict[str, Any]:
         + experience_score * float(weights.get("experience", 0.1))
     )
     if not must_have_ok:
-        final *= 0.25
+        # LinkedIn/Apify: softer penalty so missing must-haves don't hard-cap under 80%
+        if soft_must_have and _is_linkedin_or_apify_candidate(candidate):
+            final *= 0.85
+        elif _is_linkedin_or_apify_candidate(candidate):
+            final *= 0.7
+        else:
+            final *= 0.25
     return {
         "title_score": round(title_score, 2),
         "skill_match_pct": round(skill_match_pct, 2),

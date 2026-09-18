@@ -13,8 +13,7 @@ from talent_acquisition.apify_linkedin_connector import (
     APIFY_RUNS_COLLECTION,
     CONNECTOR_COLL,
     CONNECTOR_NAME,
-    PIPELINE_ENRICH_RUNNING,
-    PIPELINE_SEARCH_RUNNING,
+    PIPELINE_ACTIVE_STATUSES,
     ensure_apify_linkedin_defaults,
     get_apify_token,
     process_pending_apify_pipelines,
@@ -71,6 +70,8 @@ def create_apify_linkedin_router(
             "token_set": bool(get_apify_token()),
             "apify_search_actor_id": cfg.get("apify_search_actor_id"),
             "apify_enrich_actor_id": cfg.get("apify_enrich_actor_id"),
+            "apify_email_actor_id": cfg.get("apify_email_actor_id"),
+            "apify_email_fallback_enabled": bool(cfg.get("apify_email_fallback_enabled", True)),
             "apify_max_results_per_search": cfg.get("apify_max_results_per_search"),
             "apify_default_geocode": cfg.get("apify_default_geocode"),
         }
@@ -102,7 +103,7 @@ def create_apify_linkedin_router(
         doc = await db[APIFY_RUNS_COLLECTION].find_one({"id": pipeline_id}, {"_id": 0})
         if not doc:
             raise HTTPException(status_code=404, detail="Pipeline not found")
-        if doc.get("status") not in ("search_running", "enrich_running"):
+        if doc.get("status") not in PIPELINE_ACTIVE_STATUSES:
             return {"message": "Pipeline not active", "pipeline": doc}
         await process_pending_apify_pipelines(
             db, cfg, upsert_candidate, limit=1, pipeline_id=pipeline_id
@@ -130,7 +131,7 @@ def create_apify_linkedin_router(
             {"_id": 0},
             sort=[("created_at", -1)],
         )
-        if doc and doc.get("status") in (PIPELINE_SEARCH_RUNNING, PIPELINE_ENRICH_RUNNING):
+        if doc and doc.get("status") in PIPELINE_ACTIVE_STATUSES:
             cfg = await _load_cfg()
             try:
                 await process_pending_apify_pipelines(
